@@ -1,0 +1,315 @@
+#include "localization/ParticleFilter.h"
+#include "localization/Util.h"
+
+#include "tf/tf.h"
+
+using namespace std;
+
+ParticleFilter::ParticleFilter(int numberOfParticles) {
+	this->numberOfParticles = numberOfParticles;
+
+	// initialize particles
+	for (int i = 0; i < numberOfParticles; i++) {
+		this->particleSet.push_back(new Particle());
+	}
+
+	// this variable holds the estimated robot pose
+	this->bestHypothesis = new Particle();
+
+	// at each correction step of the filter only the laserSkip-th beam of a scan should be integrated
+	this->laserSkip = 5;
+
+	// distance map used for computing the likelihood field
+	this->distMap = NULL;
+}
+
+ParticleFilter::~ParticleFilter() {
+	// delete particles
+	for (int i = 0; i < numberOfParticles; i++) {
+		Particle* p = this->particleSet[i];
+		delete p;
+	}
+
+	this->particleSet.clear();
+
+	if (this->likelihoodField)
+		delete[] this->likelihoodField;
+
+	delete this->bestHypothesis;
+
+	if (this->distMap)
+		delete[] this->distMap;
+}
+
+int ParticleFilter::getNumberOfParticles() {
+	return this->numberOfParticles;
+}
+
+std::vector<Particle*>* ParticleFilter::getParticleSet() {
+	return &(this->particleSet);
+}
+
+void ParticleFilter::initParticlesUniform() {
+    //get map properties
+    int mapWidth, mapHeight;
+    double mapResolution;
+    this->getLikelihoodField(mapWidth, mapHeight,mapResolution);
+
+	// TODO: here comes your code
+	//DEBUG
+	/*ROS_INFO( "N = %d", N);
+	ROS_INFO( "mapWidth = %d", mapWidth);
+	ROS_INFO( "mapHeight = %d", mapHeight);
+	ROS_INFO( "Resolution = %f", mapResolution);
+	ROS_INFO( "set = %f", set[0]);
+	ROS_INFO( "set = %f", set[0]*);
+	ROS_INFO( "set = %d", set[0]);*/
+	for (auto& particle : particleSet) {
+		particle->x = Util::uniformRandom(0., mapWidth * mapResolution);
+		//ROS_INFO( "x = %f", x);
+		particle->y = Util::uniformRandom(0., mapHeight * mapResolution);
+		//ROS_INFO( "y = %f", x);
+		particle->theta = Util::uniformRandom(0., 2 * M_PI);
+		//ROS_INFO( "theta = %f", x);
+		particle->weight = 1;
+		//ROS_INFO( "set = %f", set[i]);
+	}
+}
+
+void ParticleFilter::initParticlesGaussian(double mean_x, double mean_y,
+		double mean_theta, double std_xx, double std_yy, double std_tt) {
+	// TODO: here comes your code
+	for (auto& particle : particleSet) {
+		particle->x = Util::gaussianRandom(mean_x, std_xx);
+		particle->y = Util::gaussianRandom(mean_y, std_yy);
+		particle->theta = Util::gaussianRandom(mean_theta, std_tt);
+		particle->weight = 1;
+	}
+}
+
+/**
+ *  Initializes the likelihood field as our sensor model.
+ */
+void ParticleFilter::setMeasurementModelLikelihoodField(
+		const nav_msgs::OccupancyGrid& map, double zRand, double sigmaHit) {
+	ROS_INFO("Creating likelihood field for laser range finder...");
+
+	// create the likelihood field - with the same discretization as the occupancy grid map
+	this->likelihoodField = new double[map.info.height * map.info.width];
+	this->likelihoodFieldWidth = map.info.width;
+	this->likelihoodFieldHeight = map.info.height;
+	this->likelihoodFieldResolution = map.info.resolution;
+
+    // calculates the distance map and stores it in member variable 'distMap'
+	// for every map position it contains the distance to the nearest occupied cell.
+	calculateDistanceMap(map);
+	double newSigma = sigmaHit / likelihoodFieldResolution;
+	//ROS_INFO("LIKELIHOODWIDTH!!!!!!!!!:    %f", likelihoodFieldWidth*likelihoodFieldResolution);
+
+	for (int i = 0; i < likelihoodFieldWidth * likelihoodFieldResolution; i++) {
+		for (int j = 0; j < likelihoodFieldHeight * likelihoodFieldResolution; j++) {
+			int index = j * likelihoodFieldWidth + i;
+			double pHit = Util::gaussian(distMap[index], newSigma, 0.);
+			double pRand = 1;
+			double zHit = 1 - zRand;  //(pRand=1, zHit+zRand=1)
+			likelihoodField[index] = log(zHit * pHit + zRand * pRand);
+		}
+	}
+
+    // Here you have to create your likelihood field
+	// HINT0: sigmaHit is given in meters. You have to take into account the resolution of the likelihood field to apply it.
+	// HINT1: You will need the distance map computed 3 lines above
+	// HINT2: You can visualize it in the map_view when clicking on "show likelihood field" and "publish all".
+	// HINT3: Storing probabilities in each cell between 0.0 and 1.0 might lead to round-off errors, therefore it is
+	// good practice to convert the probabilities into log-space, i.e. storing log(p(x,y)) in each cell. As a further
+	// advantage you can simply add the log-values in your sensor model, when you weigh each particle according the
+	// scan, instead of multiplying the probabilities, because: log(a*b) = log(a)+log(b).
+
+	// TODO: here comes your code
+	
+	ROS_INFO("...DONE creating likelihood field!");
+}
+
+void ParticleFilter::calculateDistanceMap(const nav_msgs::OccupancyGrid& map) {
+	// calculate distance map = distance to nearest occupied cell
+	distMap = new double[likelihoodFieldWidth * likelihoodFieldHeight];
+	int occupiedCellProbability = 90;
+	// initialize with max distances
+	for (int x = 0; x < likelihoodFieldWidth; x++) {
+		for (int y = 0; y < likelihoodFieldHeight; y++) {
+			distMap[x + y * likelihoodFieldWidth] = 32000.0;
+		}
+	}
+	// set occupied cells next to unoccupied space to zero
+	for (int x = 0; x < map.info.width; x++) {
+		for (int y = 0; y < map.info.height; y++) {
+			if (map.data[x + y * map.info.width] >= occupiedCellProbability) {
+				bool border = false;
+				for (int i = -1; i <= 1; i++) {
+					for (int j = -1; j <= 1; j++) {
+						if (!border && x + i >= 0 && y + j >= 0 && x + i
+								< likelihoodFieldWidth && y + j
+								< likelihoodFieldHeight && (i != 0 || j != 0)) {
+							if (map.data[x + i + (y + j) * likelihoodFieldWidth]
+									< occupiedCellProbability && map.data[x + i
+									+ (y + j) * likelihoodFieldWidth] >= 0)
+								border = true;
+						}
+						if (border)
+							distMap[x + i + (y + j) * likelihoodFieldWidth]
+									= 0.0;
+					}
+				}
+			}
+		}
+	}
+	// first pass -> SOUTHEAST
+	for (int x = 0; x < likelihoodFieldWidth; x++)
+		for (int y = 0; y < likelihoodFieldHeight; y++)
+			for (int i = -1; i <= 1; i++)
+				for (int j = -1; j <= 1; j++)
+					if (x + i >= 0 && y + j >= 0 && x + i
+							< likelihoodFieldWidth && y + j
+							< likelihoodFieldHeight && (i != 0 || j != 0)) {
+						double v = distMap[x + i + (y + j)
+								* likelihoodFieldWidth] + ((i * j != 0) ? 1.414
+								: 1);
+						if (v < distMap[x + y * likelihoodFieldWidth]) {
+							distMap[x + y * likelihoodFieldWidth] = v;
+						}
+					}
+
+	// second pass -> NORTHWEST
+	for (int x = likelihoodFieldWidth - 1; x >= 0; x--)
+		for (int y = likelihoodFieldHeight - 1; y >= 0; y--)
+			for (int i = -1; i <= 1; i++)
+				for (int j = -1; j <= 1; j++)
+					if (x + i >= 0 && y + j >= 0 && x + i
+							< likelihoodFieldWidth && y + j
+							< likelihoodFieldHeight && (i != 0 || j != 0)) {
+						double v = distMap[x + i + (y + j)
+								* likelihoodFieldWidth] + ((i * j != 0) ? 1.414
+								: 1);
+						if (v < distMap[x + y * likelihoodFieldWidth]) {
+							distMap[x + y * likelihoodFieldWidth] = v;
+						}
+					}
+}
+
+double* ParticleFilter::getLikelihoodField(int& width, int& height,
+		double& resolution) {
+	width = this->likelihoodFieldWidth;
+	height = this->likelihoodFieldHeight;
+	resolution = this->likelihoodFieldResolution;
+
+	return this->likelihoodField;
+}
+
+/**
+ *  A generic measurement integration method that invokes some specific observation model.
+ *  Maybe in the future, we add some other model here.
+ */
+void ParticleFilter::measurementModel(
+		const sensor_msgs::LaserScanConstPtr& laserScan) {
+	likelihoodFieldRangeFinderModel(laserScan);
+}
+
+/**
+ *  Method that implements the endpoint model for range finders.
+ *  It uses a precomputed likelihood field to weigh the particles according to the scan and the map.
+ */
+void ParticleFilter::likelihoodFieldRangeFinderModel(
+		const sensor_msgs::LaserScanConstPtr & laserScan) {
+	// TODO: here comes your code
+	for (auto& particle : particleSet) {
+		float alpha = laserScan->angle_min;
+		int i = 0;
+		while (alpha < laserScan->angle_max) {
+			if (!isnan(laserScan->ranges[i]) && laserScan->ranges[i] < laserScan->range_max && laserScan->ranges[i] >= laserScan->range_min)
+			{
+				double local_x = laserScan->ranges[i] * cos(alpha);
+				double local_y = laserScan->ranges[i] * sin(alpha);
+				const double global_x_2 = cos(particle->theta) * local_x - sin(particle->theta) * local_y + particle->x;
+				const double global_y_2 = sin(particle->theta) * local_x + cos(particle->theta) * local_y + particle->y;
+				
+				const double global_x = particle->x + laserScan->ranges[i] * cos(alpha + particle->theta); //plus the relative to the robot sensor distance <-ignored here
+				const double global_y = particle->y + laserScan->ranges[i] * sin(alpha + particle->theta);
+				ROS_INFO("global_x_2: %f , global_x: %f", global_x_2, global_x);
+				ROS_INFO("global_y_2: %f , global_Y: %f", global_y_2, global_y);
+				int map_global_x = global_x / likelihoodFieldResolution;
+				int map_global_y = global_y / likelihoodFieldResolution;
+
+				if (map_global_x > likelihoodFieldWidth || map_global_y > likelihoodFieldHeight || map_global_x < 0 || map_global_y < 0) {
+					particle->weight *= (0.01);
+				}
+				else {
+					particle->weight *= exp(likelihoodField[map_global_x + map_global_y * likelihoodFieldWidth]);
+				}
+			}
+			i += laserSkip;
+			alpha += laserSkip * laserScan->angle_increment;
+		}
+	}
+	
+
+}
+
+void ParticleFilter::setMotionModelOdometry(double alpha1, double alpha2,
+		double alpha3, double alpha4) {
+	this->odomAlpha1 = alpha1;
+	this->odomAlpha2 = alpha2;
+	this->odomAlpha3 = alpha3;
+	this->odomAlpha4 = alpha4;
+
+}
+
+/**
+ *  A generic motion integration method that invokes some specific motion model.
+ *  Maybe in the future, we add some other model here.
+ */
+void ParticleFilter::sampleMotionModel(double oldX, double oldY,
+		double oldTheta, double newX, double newY, double newTheta) {
+	sampleMotionModelOdometry(oldX, oldY, oldTheta, newX, newY, newTheta);
+}
+
+/**
+ *  Method that implements the odometry-based motion model.
+ */
+void ParticleFilter::sampleMotionModelOdometry(double oldX, double oldY,
+		double oldTheta, double newX, double newY, double newTheta) {
+	// TODO: here comes your code
+	double odom[3]; // 1.trans, 2.rot_1, 3.rot_2
+	double odom_noise[3];
+
+	odom[0] = sqrt((newX - oldX) * (newX - oldX) + (newY - oldY) * (newY - oldY));
+	odom[1] = Util::diffAngle(oldTheta, atan2((newY - oldY), (newX - oldX)));
+	odom[2] = Util::diffAngle(oldTheta + odom[1], newTheta);
+
+	for (auto& particle : particleSet) {
+		odom_noise[0] = odom[0] + Util::gaussianRandom(0, odomAlpha3 * abs(odom[0]) + odomAlpha4 * (abs(odom[1]) + abs(odom[2])));
+		odom_noise[1] = odom[1] + Util::gaussianRandom(0, odomAlpha1 * abs(odom[1]) + odomAlpha2 * abs(odom[0]));
+		odom_noise[2] = odom[2] + Util::gaussianRandom(0, odomAlpha1 * abs(odom[2]) + odomAlpha2 * abs(odom[0]));
+
+		particle->x += odom_noise[0] * cos(particle->theta + odom_noise[1]);
+		particle->y += odom_noise[0] * sin(particle->theta + odom_noise[1]);
+		particle->theta = Util::normalizeTheta(particle->theta + odom_noise[1] + odom_noise[2]);
+	}
+}
+
+/**
+ *  The stochastic importance resampling.
+ */
+void ParticleFilter::resample() {
+	// TODO: here comes your code
+}
+
+Particle* ParticleFilter::getBestHypothesis() {
+	return this->bestHypothesis;
+}
+
+// added for convenience
+int ParticleFilter::computeMapIndex(int width, int height, int x,
+		int y) {
+	return x + y * width;
+}
+
